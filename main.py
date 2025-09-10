@@ -83,7 +83,7 @@ async def add_to_inventory(user_id, item):
     user_data["inventory"].append(item)
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('UPDATE users SET inventory = ? WHERE user_id = ?', 
-                        (json.dumps(user_data["inventory"]), user_id))
+                         (json.dumps(user_data["inventory"]), user_id))
         await db.commit()
 
 # 商品データベース関数
@@ -98,7 +98,7 @@ async def add_item(emoji, name, price, description):
     """商品を追加"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('INSERT INTO items (emoji, name, price, description) VALUES (?, ?, ?, ?)', 
-                        (emoji, name, price, description))
+                         (emoji, name, price, description))
         await db.commit()
 
 async def remove_item(item_id):
@@ -123,7 +123,7 @@ async def add_user_role(user_id, role_data):
     user_data["roles"].append(role_data)
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('UPDATE users SET roles = ? WHERE user_id = ?', 
-                        (json.dumps(user_data["roles"]), user_id))
+                         (json.dumps(user_data["roles"]), user_id))
         await db.commit()
 
 async def get_all_gacha_roles():
@@ -144,7 +144,7 @@ async def add_gacha_role(role_id, name, rarity, price, description):
     """ガチャロールを追加"""
     async with aiosqlite.connect(DATABASE_FILE) as db:
         await db.execute('INSERT INTO gacha_roles (role_id, name, rarity, price, description) VALUES (?, ?, ?, ?, ?)', 
-                        (role_id, name, rarity, price, description))
+                         (role_id, name, rarity, price, description))
         await db.commit()
 
 async def remove_gacha_role(gacha_role_id):
@@ -165,10 +165,10 @@ async def get_gacha_role_by_id(gacha_role_id):
 def get_rarity_chances():
     """レアリティの確率を返す"""
     return {
-        "Common": 60,    # 60%
-        "Rare": 25,      # 25%
-        "Epic": 12,      # 12%
-        "Legendary": 3   # 3%
+        "Common": 60,   # 60%
+        "Rare": 25,     # 25%
+        "Epic": 12,     # 12%
+        "Legendary": 3  # 3%
     }
 
 def get_rarity_emoji(rarity):
@@ -840,13 +840,16 @@ async def start_bot():
         except discord.ConnectionClosed:
             print(f'[{datetime.now()}] 接続が閉じられました。5秒後に再接続します...')
             await asyncio.sleep(5)
-        finally:pass
         except Exception as e:
             print(f'[{datetime.now()}] エラーが発生しました: {e}')
             print('10秒後に再接続を試行します...')
             await asyncio.sleep(10)
             if not bot.is_closed():
                 await bot.close()
+        finally:
+            # tryブロックの後に必ず実行される部分。
+            # 今回は特に処理がないためpassを記述。
+            pass
 
 if __name__ == '__main__':
     try:

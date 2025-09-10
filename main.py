@@ -1,4 +1,4 @@
-import discord
+pip install discord.pyimport discord
 import os
 import sys
 import asyncio

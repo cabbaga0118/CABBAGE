@@ -840,7 +840,7 @@ async def start_bot():
         except discord.ConnectionClosed:
             print(f'[{datetime.now()}] 接続が閉じられました。5秒後に再接続します...')
             await asyncio.sleep(5)
-        finally:
+        finally:pass
         except Exception as e:
             print(f'[{datetime.now()}] エラーが発生しました: {e}')
             print('10秒後に再接続を試行します...')

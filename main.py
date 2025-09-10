@@ -1,859 +1,746 @@
-import os
-import sys
-import asyncio
+import discord
+from discord.ext import commands
 import aiosqlite
 import random
-import json
-from discord.ext import commands
-from datetime import datetime
+import os
+import asyncio
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-# Botの設定
+load_dotenv()
+
+# Bot設定
 intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# 開始時間を記録するための変数
-bot_start_time = None
 
-# データベースファイル
-DATABASE_FILE = 'bot_economy.db'
-
-# 商品データは現在データベースで管理されています
-
-# スロットの絵文字
-SLOT_EMOJIS = ["🍎", "🍊", "🍇", "🍓", "🍌", "🥝", "🍑"]
-
-async def init_database():
-    """データベースを初期化"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
+# データベース初期化
+async def init_db():
+    async with aiosqlite.connect('bot_database.db') as db:
+        # ユーザーのお金を管理するテーブル
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS user_money (
                 user_id INTEGER PRIMARY KEY,
-                money INTEGER DEFAULT 1000,
-                inventory TEXT DEFAULT "[]",
-                roles TEXT DEFAULT "[]"
+                balance INTEGER DEFAULT 1000,
+                last_daily DATE
             )
         ''')
+
+        # 既存テーブルにlast_dailyカラムを追加（存在しない場合）
+        try:
+            await db.execute(
+                'ALTER TABLE user_money ADD COLUMN last_daily DATE')
+        except:
+            pass  # カラムが既に存在する場合はエラーを無視
+
+        # ショップアイテムを管理するテーブル
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS items (
+            CREATE TABLE IF NOT EXISTS shop_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                emoji TEXT NOT NULL,
                 name TEXT NOT NULL,
                 price INTEGER NOT NULL,
-                description TEXT NOT NULL
+                description TEXT,
+                stock INTEGER DEFAULT -1
             )
         ''')
+
+        # ガチャロールを管理するテーブル
         await db.execute('''
             CREATE TABLE IF NOT EXISTS gacha_roles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 role_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                rarity TEXT NOT NULL,
-                price INTEGER NOT NULL,
-                description TEXT NOT NULL
+                role_name TEXT NOT NULL,
+                probability REAL NOT NULL,
+                description TEXT
             )
         ''')
+
+        # 既存テーブルからcostカラムを削除（存在する場合）
+        try:
+            await db.execute('ALTER TABLE gacha_roles DROP COLUMN cost')
+        except:
+            pass  # カラムが存在しない場合はエラーを無視
+
         await db.commit()
 
-async def get_user_data(user_id):
-    """ユーザーデータを取得"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT money, inventory, roles FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return {"money": row[0], "inventory": json.loads(row[1]), "roles": json.loads(row[2] or "[]")}
-            else:
-                # 新規ユーザー
-                await db.execute('INSERT INTO users (user_id) VALUES (?)', (user_id,))
-                await db.commit()
-                return {"money": 1000, "inventory": [], "roles": []}
 
-async def update_user_money(user_id, money):
-    """ユーザーのお金を更新"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('UPDATE users SET money = ? WHERE user_id = ?', (money, user_id))
+# ユーザーの残高取得・初期化
+async def get_user_balance(user_id):
+    async with aiosqlite.connect('bot_database.db') as db:
+        cursor = await db.execute(
+            'SELECT balance FROM user_money WHERE user_id = ?', (user_id, ))
+        result = await cursor.fetchone()
+
+        if result is None:
+            await db.execute(
+                'INSERT INTO user_money (user_id, balance) VALUES (?, ?)',
+                (user_id, 1000))
+            await db.commit()
+            return 1000
+
+        return result[0]
+
+
+# ユーザーの残高更新
+async def update_user_balance(user_id, new_balance):
+    async with aiosqlite.connect('bot_database.db') as db:
+        await db.execute('UPDATE user_money SET balance = ? WHERE user_id = ?',
+                         (new_balance, user_id))
         await db.commit()
 
-async def add_to_inventory(user_id, item):
-    """ユーザーのインベントリにアイテムを追加"""
-    user_data = await get_user_data(user_id)
-    user_data["inventory"].append(item)
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('UPDATE users SET inventory = ? WHERE user_id = ?', 
-                         (json.dumps(user_data["inventory"]), user_id))
-        await db.commit()
-
-# 商品データベース関数
-async def get_all_items():
-    """すべての商品を取得"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT id, emoji, name, price, description FROM items') as cursor:
-            rows = await cursor.fetchall()
-            return [{"id": row[0], "emoji": row[1], "name": row[2], "price": row[3], "description": row[4]} for row in rows]
-
-async def add_item(emoji, name, price, description):
-    """商品を追加"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('INSERT INTO items (emoji, name, price, description) VALUES (?, ?, ?, ?)', 
-                         (emoji, name, price, description))
-        await db.commit()
-
-async def remove_item(item_id):
-    """商品を削除"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('DELETE FROM items WHERE id = ?', (item_id,))
-        await db.commit()
-
-async def get_item_by_id(item_id):
-    """IDで商品を取得"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT id, emoji, name, price, description FROM items WHERE id = ?', (item_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return {"id": row[0], "emoji": row[1], "name": row[2], "price": row[3], "description": row[4]}
-            return None
-
-# ロールガチャ関数
-async def add_user_role(user_id, role_data):
-    """ユーザーにロールを追加"""
-    user_data = await get_user_data(user_id)
-    user_data["roles"].append(role_data)
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('UPDATE users SET roles = ? WHERE user_id = ?', 
-                         (json.dumps(user_data["roles"]), user_id))
-        await db.commit()
-
-async def get_all_gacha_roles():
-    """すべてのガチャロールを取得"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT id, role_id, name, rarity, price, description FROM gacha_roles') as cursor:
-            rows = await cursor.fetchall()
-            return [{"id": row[0], "role_id": row[1], "name": row[2], "rarity": row[3], "price": row[4], "description": row[5]} for row in rows]
-
-async def get_roles_by_rarity(rarity):
-    """レアリティ別にロールを取得"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT id, role_id, name, rarity, price, description FROM gacha_roles WHERE rarity = ?', (rarity,)) as cursor:
-            rows = await cursor.fetchall()
-            return [{"id": row[0], "role_id": row[1], "name": row[2], "rarity": row[3], "price": row[4], "description": row[5]} for row in rows]
-
-async def add_gacha_role(role_id, name, rarity, price, description):
-    """ガチャロールを追加"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('INSERT INTO gacha_roles (role_id, name, rarity, price, description) VALUES (?, ?, ?, ?, ?)', 
-                         (role_id, name, rarity, price, description))
-        await db.commit()
-
-async def remove_gacha_role(gacha_role_id):
-    """ガチャロールを削除"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        await db.execute('DELETE FROM gacha_roles WHERE id = ?', (gacha_role_id,))
-        await db.commit()
-
-async def get_gacha_role_by_id(gacha_role_id):
-    """IDでガチャロールを取得"""
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT id, role_id, name, rarity, price, description FROM gacha_roles WHERE id = ?', (gacha_role_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return {"id": row[0], "role_id": row[1], "name": row[2], "rarity": row[3], "price": row[4], "description": row[5]}
-            return None
-
-def get_rarity_chances():
-    """レアリティの確率を返す"""
-    return {
-        "Common": 60,   # 60%
-        "Rare": 25,     # 25%
-        "Epic": 12,     # 12%
-        "Legendary": 3  # 3%
-    }
-
-def get_rarity_emoji(rarity):
-    """レアリティの絵文字を返す"""
-    return {
-        "Common": "⚪",
-        "Rare": "🔵", 
-        "Epic": "🟣",
-        "Legendary": "🟡"
-    }.get(rarity, "⚪")
-
-def is_admin_interaction(interaction):
-    """管理者権限をチェックする関数（インタラクション用）"""
-    return interaction.user.guild_permissions.administrator or interaction.user == interaction.guild.owner
 
 @bot.event
 async def on_ready():
-    global bot_start_time
-    if bot.user:
-        # データベースを初期化
-        await init_database()
-        
-        # 開始時間を記録
-        bot_start_time = datetime.now()
-        print(f'[{datetime.now()}] {bot.user} としてログインしました！')
-        print(f'Bot ID: {bot.user.id}')
-        print(f'接続先サーバー数: {len(bot.guilds)}')
-        
-        # スラッシュコマンドを同期（グローバル）
-        try:
-            synced = await bot.tree.sync()
-            print(f'グローバル同期されたスラッシュコマンド数: {len(synced)}')
-        except Exception as e:
-            print(f'グローバルスラッシュコマンド同期エラー: {e}')
-        
-        # 各ギルドでもコマンドを同期
-        for guild in bot.guilds:
-            try:
-                synced_guild = await bot.tree.sync(guild=guild)
-                print(f'ギルド {guild.name} で同期されたコマンド数: {len(synced_guild)}')
-            except Exception as e:
-                print(f'ギルド {guild.name} でのコマンド同期エラー: {e}')
-        
-        # ボットのステータスを設定
-        await bot.change_presence(activity=discord.Game(name="/help でコマンド確認"))
+    print(f'{bot.user} としてログインしました！')
+    await init_db()
 
-@bot.event
-async def on_disconnect():
-    print(f'[{datetime.now()}] ボットが切断されました。再接続を試行中...')
+    # スラッシュコマンドを同期
+    try:
+        synced = await bot.tree.sync()
+        print(f"{len(synced)} 個のスラッシュコマンドを同期しました")
+    except Exception as e:
+        print(f"スラッシュコマンドの同期に失敗しました: {e}")
 
-@bot.event
-async def on_resumed():
-    print(f'[{datetime.now()}] ボットが再接続されました！')
 
-# スラッシュコマンド: 残高確認
-@bot.tree.command(name="balance", description="あなたの残高を確認します")
-async def balance(interaction: discord.Interaction):
-    user_data = await get_user_data(interaction.user.id)
-    
-    embed = discord.Embed(
-        title="💰 残高",
-        description=f"{interaction.user.mention}の残高: **{user_data['money']:,}円**",
-        color=discord.Color.green()
-    )
-    await interaction.response.send_message(embed=embed)
+# スロットマシンコマンド
+@bot.tree.command(
+    name="slot",
+    description="Play slot machine! Bet money and try to get triple matches")
+async def slot_machine(interaction: discord.Interaction, bet_amount: int):
+    user_id = interaction.user.id
 
-# スラッシュコマンド: スロットゲーム
-@bot.tree.command(name="slot", description="スロットゲームで運試し！")
-async def slot(interaction: discord.Interaction, bet: int):
-    if bet <= 0:
-        await interaction.response.send_message("❌ ベット額は1円以上にしてください！", ephemeral=True)
+    if bet_amount <= 0:
+        await interaction.response.send_message(
+            "Bet amount must be 1 or more!", ephemeral=True)
         return
-    
-    user_data = await get_user_data(interaction.user.id)
-    
-    if user_data["money"] < bet:
-        await interaction.response.send_message("❌ お金が足りません！", ephemeral=True)
+
+    current_balance = await get_user_balance(user_id)
+
+    if current_balance < bet_amount:
+        await interaction.response.send_message(
+            f"Insufficient balance! Current: {current_balance} coins",
+            ephemeral=True)
         return
-    
-    # スロットを回す
-    slot1 = random.choice(SLOT_EMOJIS)
-    slot2 = random.choice(SLOT_EMOJIS)
-    slot3 = random.choice(SLOT_EMOJIS)
-    
+
+    # スロットのシンボル
+    symbols = ['🍒', '🍋', '🍊', '🍇', '🍎', '💎', '⭐', '7️⃣']
+
+    # スロット結果生成
+    result = [random.choice(symbols) for _ in range(3)]
+
     # 勝利判定
-    if slot1 == slot2 == slot3:
-        # 大当たり（同じ絵文字3つ）
-        winnings = bet * 10
-        result_text = "🎉 **大当たり！** 🎉"
-        color = discord.Color.gold()
-    elif slot1 == slot2 or slot2 == slot3 or slot1 == slot3:
-        # 小当たり（2つ同じ）
-        winnings = bet * 2
-        result_text = "✨ **小当たり！** ✨"
-        color = discord.Color.blue()
-    else:
-        # はずれ
-        winnings = -bet
-        result_text = "💸 **はずれ...**"
-        color = discord.Color.red()
-    
-    # お金を更新
-    new_money = user_data["money"] + winnings
-    await update_user_money(interaction.user.id, new_money)
-    
-    embed = discord.Embed(
-        title="🎰 スロットマシン",
-        description=f"**{slot1} {slot2} {slot3}**\n\n{result_text}",
-        color=color
-    )
-    embed.add_field(name="ベット額", value=f"{bet:,}円", inline=True)
-    
-    if winnings > 0:
-        embed.add_field(name="獲得額", value=f"+{winnings:,}円", inline=True)
-    else:
-        embed.add_field(name="損失額", value=f"{winnings:,}円", inline=True)
-    
-    embed.add_field(name="残高", value=f"{new_money:,}円", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-# スラッシュコマンド: ショップ
-@bot.tree.command(name="shop", description="ショップで商品を確認します")
-async def shop(interaction: discord.Interaction):
-    items = await get_all_items()
-    
-    embed = discord.Embed(
-        title="🏪 ショップ",
-        color=discord.Color.purple()
-    )
-    
-    if not items:
-        embed.description = "現在、商品はありません。管理者によって商品が追加されるまでお待ちください。"
-    else:
-        embed.description = "以下の商品を購入できます："
-        for item in items:
-            embed.add_field(
-                name=f"{item['emoji']} {item['name']}",
-                value=f"ID: {item['id']}\n価格: {item['price']:,}円\n{item['description']}",
-                inline=True
-            )
-        embed.set_footer(text="/buy <商品ID> で購入できます")
-    
-    await interaction.response.send_message(embed=embed)
-
-# スラッシュコマンド: 商品購入
-@bot.tree.command(name="buy", description="ショップで商品を購入します")
-async def buy(interaction: discord.Interaction, item_id: int):
-    # IDで商品を検索
-    item_data = await get_item_by_id(item_id)
-    
-    if not item_data:
-        await interaction.response.send_message(
-            f"❌ 商品ID {item_id} が見つかりません！/shop で利用可能な商品を確認してください。", 
-            ephemeral=True
-        )
-        return
-    
-    user_data = await get_user_data(interaction.user.id)
-    
-    if user_data["money"] < item_data["price"]:
-        await interaction.response.send_message(
-            f"❌ お金が足りません！\n必要額: {item_data['price']:,}円\n現在の残高: {user_data['money']:,}円", 
-            ephemeral=True
-        )
-        return
-    
-    # 購入処理
-    new_money = user_data["money"] - item_data["price"]
-    await update_user_money(interaction.user.id, new_money)
-    await add_to_inventory(interaction.user.id, f"{item_data['emoji']} {item_data['name']}")
-    
-    embed = discord.Embed(
-        title="✅ 購入完了",
-        description=f"{item_data['emoji']} **{item_data['name']}** を購入しました！",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="価格", value=f"{item_data['price']:,}円", inline=True)
-    embed.add_field(name="残高", value=f"{new_money:,}円", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-# スラッシュコマンド: インベントリ
-@bot.tree.command(name="inventory", description="あなたの所持品を確認します")
-async def inventory(interaction: discord.Interaction):
-    user_data = await get_user_data(interaction.user.id)
-    
-    embed = discord.Embed(
-        title="🎒 インベントリ",
-        color=discord.Color.blue()
-    )
-    
-    if not user_data["inventory"]:
-        embed.description = "まだ何も持っていません。ショップで商品を購入してみましょう！"
-    else:
-        # アイテムを数える
-        item_counts = {}
-        for item in user_data["inventory"]:
-            item_counts[item] = item_counts.get(item, 0) + 1
-        
-        inventory_text = "\n".join([f"{item} x{count}" for item, count in item_counts.items()])
-        embed.description = inventory_text
-    
-    embed.add_field(name="残高", value=f"{user_data['money']:,}円", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-# スラッシュコマンド: デイリーボーナス
-@bot.tree.command(name="daily", description="デイリーボーナスを受け取ります")
-async def daily(interaction: discord.Interaction):
-    user_data = await get_user_data(interaction.user.id)
-    
-    # デイリーボーナス（100-500円）
-    bonus = random.randint(100, 500)
-    new_money = user_data["money"] + bonus
-    await update_user_money(interaction.user.id, new_money)
-    
-    embed = discord.Embed(
-        title="🎁 デイリーボーナス",
-        description=f"**{bonus:,}円** を受け取りました！",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="新しい残高", value=f"{new_money:,}円", inline=True)
-    
-    await interaction.response.send_message(embed=embed)
-
-# スラッシュコマンド: リーダーボード
-@bot.tree.command(name="leaderboard", description="お金持ちランキングを表示します")
-async def leaderboard(interaction: discord.Interaction):
-    async with aiosqlite.connect(DATABASE_FILE) as db:
-        async with db.execute('SELECT user_id, money FROM users ORDER BY money DESC LIMIT 10') as cursor:
-            rows = await cursor.fetchall()
-    
-    embed = discord.Embed(
-        title="💰 お金持ちランキング",
-        color=discord.Color.gold()
-    )
-    
-    if not rows:
-        embed.description = "まだデータがありません。"
-    else:
-        ranking_text = ""
-        for i, (user_id, money) in enumerate(rows, 1):
-            try:
-                user = await bot.fetch_user(user_id)
-                username = user.display_name
-            except:
-                username = f"ユーザー#{user_id}"
-            
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            ranking_text += f"{medal} {username}: {money:,}円\n"
-        
-        embed.description = ranking_text
-    
-    await interaction.response.send_message(embed=embed)
-
-# スラッシュコマンド: ロールガチャ
-@bot.tree.command(name="role_gacha", description="ロールガチャを引いてランダムなロールを獲得しよう！")
-async def role_gacha(interaction: discord.Interaction, price: int = 1000):
-    if price <= 0:
-        await interaction.response.send_message("❌ ガチャ価格は1円以上にしてください！", ephemeral=True)
-        return
-    
-    user_data = await get_user_data(interaction.user.id)
-    
-    if user_data["money"] < price:
-        await interaction.response.send_message(
-            f"❌ お金が足りません！\n必要額: {price:,}円\n現在の残高: {user_data['money']:,}円", 
-            ephemeral=True
-        )
-        return
-    
-    # レアリティを決定
-    rarity_chances = get_rarity_chances()
-    rand = random.randint(1, 100)
-    
-    selected_rarity = None
-    cumulative = 0
-    for rarity, chance in rarity_chances.items():
-        cumulative += chance
-        if rand <= cumulative:
-            selected_rarity = rarity
-            break
-    
-    # 選択されたレアリティのロールを取得
-    available_roles = await get_roles_by_rarity(selected_rarity)
-    
-    if not available_roles:
-        await interaction.response.send_message(
-            f"❌ {selected_rarity}レアリティのロールが存在しません。管理者にお問い合わせください。", 
-            ephemeral=True
-        )
-        return
-    
-    # ランダムにロールを選択
-    selected_role = random.choice(available_roles)
-    
-    # お金を減算
-    new_money = user_data["money"] - price
-    await update_user_money(interaction.user.id, new_money)
-    
-    # ユーザーにロールを追加
-    role_data = {
-        "id": selected_role["id"],
-        "name": selected_role["name"],
-        "rarity": selected_role["rarity"]
-    }
-    await add_user_role(interaction.user.id, role_data)
-    
-    # Discordサーバーでロールを付与
-    try:
-        if interaction.guild:
-            guild_role = interaction.guild.get_role(selected_role["role_id"])
-            member = interaction.guild.get_member(interaction.user.id)
-            if guild_role and member:
-                await member.add_roles(guild_role)
-                role_granted = True
-            else:
-                role_granted = False
+    win_amount = 0
+    if result[0] == result[1] == result[2]:
+        if result[0] == '💎':
+            win_amount = bet_amount * 10  # Diamond is 10x
+        elif result[0] == '7️⃣':
+            win_amount = bet_amount * 15  # Lucky 7 is 15x
+        elif result[0] == '⭐':
+            win_amount = bet_amount * 8  # Star is 8x
         else:
-            role_granted = False
-    except:
-        role_granted = False
-    
-    embed = discord.Embed(
-        title="🎲 ロールガチャ結果",
-        color=discord.Color.gold() if selected_rarity == "Legendary" else 
-              discord.Color.purple() if selected_rarity == "Epic" else
-              discord.Color.blue() if selected_rarity == "Rare" else
-              discord.Color.light_grey()
-    )
-    
-    rarity_emoji = get_rarity_emoji(selected_rarity)
-    embed.add_field(
-        name="獲得ロール",
-        value=f"{rarity_emoji} **{selected_role['name']}**\n{selected_role['description']}",
-        inline=False
-    )
-    embed.add_field(name="レアリティ", value=f"{rarity_emoji} {selected_rarity}", inline=True)
-    embed.add_field(name="消費額", value=f"{price:,}円", inline=True)
-    embed.add_field(name="残高", value=f"{new_money:,}円", inline=True)
-    
-    if not role_granted:
-        embed.add_field(
-            name="⚠️ 注意", 
-            value="ロールは記録されましたが、サーバーでの付与に失敗しました。", 
-            inline=False
-        )
-    
-    await interaction.response.send_message(embed=embed)
+            win_amount = bet_amount * 5  # Others are 5x
+    elif len(set(result)) == 2:  # Two matches
+        win_amount = bet_amount * 2
 
-# スラッシュコマンド: ロール確認
-@bot.tree.command(name="my_roles", description="あなたの所持ロールを確認します")
-async def my_roles(interaction: discord.Interaction):
-    user_data = await get_user_data(interaction.user.id)
-    
+    # Update balance
+    new_balance = current_balance - bet_amount + win_amount
+    await update_user_balance(user_id, new_balance)
+
+    # 結果表示
     embed = discord.Embed(
-        title="🎭 あなたの所持ロール",
-        color=discord.Color.blue()
-    )
-    
-    if not user_data["roles"]:
-        embed.description = "まだロールを持っていません。/role_gacha でロールガチャを引いてみましょう！"
+        title="🎰 スロットマシン 🎰",
+        color=0x00ff00 if win_amount > bet_amount else 0xff0000)
+    embed.add_field(name="結果", value=" ".join(result), inline=False)
+    embed.add_field(name="Bet", value=f"{bet_amount} coins", inline=True)
+
+    if win_amount > 0:
+        profit = win_amount - bet_amount
+        embed.add_field(name="Won", value=f"{win_amount} coins", inline=True)
+        embed.add_field(name="Profit", value=f"+{profit} coins", inline=True)
+        if win_amount >= bet_amount * 10:
+            embed.add_field(name="🎉 JACKPOT!",
+                            value="Congratulations!",
+                            inline=False)
     else:
-        # ロール数をカウント
-        role_counts = {}
-        for role in user_data["roles"]:
-            key = f"{role['name']} ({role['rarity']})"
-            role_counts[key] = role_counts.get(key, 0) + 1
-        
-        roles_text = ""
-        for role_name, count in role_counts.items():
-            roles_text += f"{role_name} x{count}\n"
-        
-        embed.description = roles_text
-        embed.add_field(name="総ロール数", value=f"{len(user_data['roles'])}個", inline=True)
-    
-    embed.add_field(name="残高", value=f"{user_data['money']:,}円", inline=True)
-    
+        embed.add_field(name="Result", value="Loss", inline=True)
+        embed.add_field(name="Loss", value=f"-{bet_amount} coins", inline=True)
+
+    embed.add_field(name="New Balance",
+                    value=f"{new_balance} coins",
+                    inline=False)
+
     await interaction.response.send_message(embed=embed)
 
-# 管理者専用スラッシュコマンド: 商品追加
-@bot.tree.command(name="add_item", description="ショップに商品を追加します（管理者専用）")
-async def add_item_command(interaction: discord.Interaction, emoji: str, name: str, price: int, description: str):
-    if not is_admin_interaction(interaction):
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
-    
-    if price <= 0:
-        await interaction.response.send_message("❌ 価格は1円以上にしてください。", ephemeral=True)
-        return
-    
-    try:
-        await add_item(emoji, name, price, description)
-        
-        embed = discord.Embed(
-            title="✅ 商品追加完了",
-            description=f"新しい商品を追加しました！",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="商品", value=f"{emoji} {name}", inline=True)
-        embed.add_field(name="価格", value=f"{price:,}円", inline=True)
-        embed.add_field(name="説明", value=description, inline=False)
-        
-        await interaction.response.send_message(embed=embed)
-        print(f'[{datetime.now()}] {interaction.user}が商品を追加: {emoji} {name} ({price}円)')
-        
-    except Exception as e:
-        await interaction.response.send_message(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
-# 管理者専用スラッシュコマンド: 商品削除
-@bot.tree.command(name="remove_item", description="ショップから商品を削除します（管理者専用）")
-async def remove_item_command(interaction: discord.Interaction, item_id: int):
-    if not is_admin_interaction(interaction):
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
-    
-    # 商品の存在確認
-    item_data = await get_item_by_id(item_id)
-    if not item_data:
-        await interaction.response.send_message(f"❌ 商品ID {item_id} が見つかりません。", ephemeral=True)
-        return
-    
-    try:
-        await remove_item(item_id)
-        
-        embed = discord.Embed(
-            title="✅ 商品削除完了",
-            description=f"商品を削除しました。",
-            color=discord.Color.red()
-        )
-        embed.add_field(name="削除された商品", value=f"{item_data['emoji']} {item_data['name']}", inline=True)
-        embed.add_field(name="価格", value=f"{item_data['price']:,}円", inline=True)
-        
-        await interaction.response.send_message(embed=embed)
-        print(f'[{datetime.now()}] {interaction.user}が商品を削除: {item_data["name"]} (ID: {item_id})')
-        
-    except Exception as e:
-        await interaction.response.send_message(f"❌ エラーが発生しました: {e}", ephemeral=True)
+# Balance check command
+@bot.tree.command(name="balance", description="Check your current balance")
+async def check_balance(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    balance = await get_user_balance(user_id)
 
-# 管理者専用スラッシュコマンド: 商品一覧管理
-@bot.tree.command(name="manage_items", description="商品管理（一覧表示・管理者専用）")
-async def manage_items(interaction: discord.Interaction):
-    if not is_admin_interaction(interaction):
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
-    
-    items = await get_all_items()
-    
-    embed = discord.Embed(
-        title="🛠️ 商品管理",
-        color=discord.Color.blue()
-    )
-    
+    embed = discord.Embed(title="💰 残高確認", color=0x00ff00)
+    embed.add_field(name="Your Balance",
+                    value=f"{balance} coins",
+                    inline=False)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Shop display command
+@bot.tree.command(name="shop", description="Display shop items")
+async def shop(interaction: discord.Interaction):
+    async with aiosqlite.connect('bot_database.db') as db:
+        cursor = await db.execute(
+            'SELECT id, name, price, description, stock FROM shop_items')
+        items = await cursor.fetchall()
+
     if not items:
-        embed.description = "現在、登録されている商品はありません。"
-    else:
-        embed.description = f"登録されている商品数: {len(items)}"
-        for item in items:
-            embed.add_field(
-                name=f"ID: {item['id']} | {item['emoji']} {item['name']}",
-                value=f"価格: {item['price']:,}円\n{item['description']}",
-                inline=False
-            )
-    
-    embed.set_footer(text="/add_item で追加、/remove_item <ID> で削除")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message("No items in shop.",
+                                                ephemeral=True)
+        return
 
-# 管理者専用スラッシュコマンド: ロール追加
-@bot.tree.command(name="add_role", description="ガチャロールを追加します（管理者専用）")
-async def add_role_command(interaction: discord.Interaction, role: discord.Role, rarity: str, price: int, description: str):
-    if not is_admin_interaction(interaction):
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
+    embed = discord.Embed(title="🛒 ショップ", color=0x0099ff)
+
+    for item in items:
+        item_id, name, price, description, stock = item
+        stock_text = f"Stock: {stock}" if stock != -1 else "Stock: Unlimited"
+        embed.add_field(
+            name=f"{name} (ID: {item_id})",
+            value=f"Price: {price} coins\n{description}\n{stock_text}",
+            inline=False)
+
+    embed.add_field(name="How to buy",
+                    value="Use /buy <item_id> to purchase items",
+                    inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Buy command
+@bot.tree.command(name="buy", description="Buy an item from the shop")
+async def buy_item(interaction: discord.Interaction, item_id: int):
+    user_id = interaction.user.id
+
+    async with aiosqlite.connect('bot_database.db') as db:
+        # Get item info
+        cursor = await db.execute(
+            'SELECT name, price, stock FROM shop_items WHERE id = ?',
+            (item_id, ))
+        item = await cursor.fetchone()
+
+        if not item:
+            await interaction.response.send_message(
+                "Item with specified ID not found.", ephemeral=True)
+            return
+
+        name, price, stock = item
+
+        # Check stock
+        if stock == 0:
+            await interaction.response.send_message(
+                "This item is out of stock.", ephemeral=True)
+            return
+
+        # Check balance
+        balance = await get_user_balance(user_id)
+        if balance < price:
+            await interaction.response.send_message(
+                f"Insufficient balance. Need: {price} coins, Current: {balance} coins",
+                ephemeral=True)
+            return
+
+        # Purchase process
+        new_balance = balance - price
+        await update_user_balance(user_id, new_balance)
+
+        # Update stock (if not unlimited)
+        if stock != -1:
+            await db.execute(
+                'UPDATE shop_items SET stock = stock - 1 WHERE id = ?',
+                (item_id, ))
+
+        await db.commit()
+
+    embed = discord.Embed(title="✅ 購入完了", color=0x00ff00)
+    embed.add_field(name="Item", value=name, inline=True)
+    embed.add_field(name="Price", value=f"{price} coins", inline=True)
+    embed.add_field(name="New Balance",
+                    value=f"{new_balance} coins",
+                    inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Admin add item command
+@bot.tree.command(name="additem",
+                  description="[Admin Only] Add a new item to the shop")
+async def add_item(interaction: discord.Interaction,
+                   item_name: str,
+                   price: int,
+                   description: str,
+                   stock: int = -1):
+    # Check admin permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "This command is for administrators only.", ephemeral=True)
         return
-    
-    if rarity not in ["Common", "Rare", "Epic", "Legendary"]:
-        await interaction.response.send_message("❌ レアリティは Common, Rare, Epic, Legendary のいずれかを指定してください。", ephemeral=True)
-        return
-    
+
     if price <= 0:
-        await interaction.response.send_message("❌ 価格は1円以上にしてください。", ephemeral=True)
+        await interaction.response.send_message("Price must be 1 or more.",
+                                                ephemeral=True)
         return
-    
-    try:
-        await add_gacha_role(role.id, role.name, rarity, price, description)
-        
-        rarity_emoji = get_rarity_emoji(rarity)
-        embed = discord.Embed(
-            title="✅ ロール追加完了",
-            description=f"新しいガチャロールを追加しました！",
-            color=discord.Color.green()
-        )
-        embed.add_field(name="ロール", value=f"{role.mention}", inline=True)
-        embed.add_field(name="レアリティ", value=f"{rarity_emoji} {rarity}", inline=True)
-        embed.add_field(name="ガチャ価格", value=f"{price:,}円", inline=True)
-        embed.add_field(name="説明", value=description, inline=False)
-        
-        await interaction.response.send_message(embed=embed)
-        print(f'[{datetime.now()}] {interaction.user}がロールを追加: {role.name} ({rarity})')
-        
-    except Exception as e:
-        await interaction.response.send_message(f"❌ エラーが発生しました: {e}", ephemeral=True)
 
-# 管理者専用スラッシュコマンド: ロール削除
-@bot.tree.command(name="remove_role", description="ガチャロールを削除します（管理者専用）")
-async def remove_role_command(interaction: discord.Interaction, role_id: int):
-    if not is_admin_interaction(interaction):
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
-        return
-    
-    # ロールの存在確認
-    role_data = await get_gacha_role_by_id(role_id)
-    if not role_data:
-        await interaction.response.send_message(f"❌ ロールID {role_id} が見つかりません。", ephemeral=True)
-        return
-    
-    try:
-        await remove_gacha_role(role_id)
-        
-        rarity_emoji = get_rarity_emoji(role_data["rarity"])
-        embed = discord.Embed(
-            title="✅ ロール削除完了",
-            description=f"ガチャロールを削除しました。",
-            color=discord.Color.red()
-        )
-        embed.add_field(name="削除されたロール", value=f"{role_data['name']}", inline=True)
-        embed.add_field(name="レアリティ", value=f"{rarity_emoji} {role_data['rarity']}", inline=True)
-        
-        await interaction.response.send_message(embed=embed)
-        print(f'[{datetime.now()}] {interaction.user}がロールを削除: {role_data["name"]} (ID: {role_id})')
-        
-    except Exception as e:
-        await interaction.response.send_message(f"❌ エラーが発生しました: {e}", ephemeral=True)
+    async with aiosqlite.connect('bot_database.db') as db:
+        await db.execute(
+            'INSERT INTO shop_items (name, price, description, stock) VALUES (?, ?, ?, ?)',
+            (item_name, price, description, stock))
+        await db.commit()
 
-# 管理者専用スラッシュコマンド: ロール一覧管理
-@bot.tree.command(name="manage_roles", description="ガチャロール管理（一覧表示・管理者専用）")
-async def manage_roles(interaction: discord.Interaction):
-    if not is_admin_interaction(interaction):
-        await interaction.response.send_message("❌ このコマンドは管理者のみ使用できます。", ephemeral=True)
+    embed = discord.Embed(title="✅ 商品追加完了", color=0x00ff00)
+    embed.add_field(name="Item Name", value=item_name, inline=True)
+    embed.add_field(name="Price", value=f"{price} coins", inline=True)
+    embed.add_field(name="Description", value=description, inline=False)
+    embed.add_field(name="Stock",
+                    value="Unlimited" if stock == -1 else f"{stock}",
+                    inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Admin remove item command
+@bot.tree.command(name="removeitem",
+                  description="[Admin Only] Remove an item from the shop")
+async def remove_item(interaction: discord.Interaction, item_id: int):
+    # 管理者権限チェック
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者のみ使用できます。",
+                                                ephemeral=True)
         return
-    
-    roles = await get_all_gacha_roles()
-    
-    embed = discord.Embed(
-        title="🎭 ガチャロール管理",
-        color=discord.Color.blue()
-    )
-    
+
+    async with aiosqlite.connect('bot_database.db') as db:
+        cursor = await db.execute('SELECT name FROM shop_items WHERE id = ?',
+                                  (item_id, ))
+        item = await cursor.fetchone()
+
+        if not item:
+            await interaction.response.send_message(
+                "Item with specified ID not found.", ephemeral=True)
+            return
+
+        await db.execute('DELETE FROM shop_items WHERE id = ?', (item_id, ))
+        await db.commit()
+
+    embed = discord.Embed(title="✅ Item Removed", color=0xff0000)
+    embed.add_field(name="Removed Item", value=item[0], inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Admin add money command
+@bot.tree.command(name="addmoney",
+                  description="[Admin Only] Add money to a user's balance")
+async def add_money(interaction: discord.Interaction, user: discord.Member,
+                    amount: int):
+    # Check admin permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "This command is for administrators only.", ephemeral=True)
+        return
+
+    if amount <= 0:
+        await interaction.response.send_message(
+            "Amount must be greater than 0.", ephemeral=True)
+        return
+
+    # Get current balance and add money
+    current_balance = await get_user_balance(user.id)
+    new_balance = current_balance + amount
+    await update_user_balance(user.id, new_balance)
+
+    embed = discord.Embed(title="💰 Money Added", color=0x00ff00)
+    embed.add_field(name="User", value=user.mention, inline=True)
+    embed.add_field(name="Amount Added", value=f"{amount} coins", inline=True)
+    embed.add_field(name="New Balance",
+                    value=f"{new_balance} coins",
+                    inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Daily bonus command
+@bot.tree.command(name="daily", description="Claim your daily bonus coins!")
+async def daily_bonus(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    today = datetime.now().date()
+    daily_amount = 500  # Daily bonus amount
+
+    async with aiosqlite.connect('bot_database.db') as db:
+        # Check when user last claimed daily bonus
+        cursor = await db.execute(
+            'SELECT balance, last_daily FROM user_money WHERE user_id = ?',
+            (user_id, ))
+        result = await cursor.fetchone()
+
+        if result is None:
+            # New user - create entry and give bonus
+            await db.execute(
+                'INSERT INTO user_money (user_id, balance, last_daily) VALUES (?, ?, ?)',
+                (user_id, 1000 + daily_amount, today))
+            await db.commit()
+
+            embed = discord.Embed(title="🎁 Daily Bonus!", color=0x00ff00)
+            embed.add_field(name="Welcome Bonus",
+                            value=f"+{daily_amount} coins",
+                            inline=True)
+            embed.add_field(name="New Balance",
+                            value=f"{1000 + daily_amount} coins",
+                            inline=True)
+            embed.add_field(name="Next Claim", value="Tomorrow!", inline=False)
+
+            await interaction.response.send_message(embed=embed)
+            return
+
+        balance, last_daily = result
+
+        # Check if user already claimed today
+        if last_daily:
+            last_daily_date = datetime.strptime(last_daily, '%Y-%m-%d').date()
+            if last_daily_date >= today:
+                # Already claimed today
+                next_claim = today + timedelta(days=1)
+                embed = discord.Embed(title="⏰ Already Claimed",
+                                      color=0xff9900)
+                embed.add_field(
+                    name="Status",
+                    value="You already claimed your daily bonus today!",
+                    inline=False)
+                embed.add_field(name="Next Claim",
+                                value=f"{next_claim.strftime('%Y-%m-%d')}",
+                                inline=True)
+                embed.add_field(name="Current Balance",
+                                value=f"{balance} coins",
+                                inline=True)
+
+                await interaction.response.send_message(embed=embed,
+                                                        ephemeral=True)
+                return
+
+        # Give daily bonus
+        new_balance = balance + daily_amount
+        await db.execute(
+            'UPDATE user_money SET balance = ?, last_daily = ? WHERE user_id = ?',
+            (new_balance, today, user_id))
+        await db.commit()
+
+    # Calculate streak bonus (optional)
+    streak_bonus = 0
+    if last_daily:
+        last_daily_date = datetime.strptime(last_daily, '%Y-%m-%d').date()
+        if (today - last_daily_date).days == 1:  # Consecutive day
+            streak_bonus = 100
+            new_balance += streak_bonus
+            await update_user_balance(user_id, new_balance)
+
+    embed = discord.Embed(title="🎁 Daily Bonus Claimed!", color=0x00ff00)
+    embed.add_field(name="Daily Bonus",
+                    value=f"+{daily_amount} coins",
+                    inline=True)
+    if streak_bonus > 0:
+        embed.add_field(name="Streak Bonus",
+                        value=f"+{streak_bonus} coins",
+                        inline=True)
+    embed.add_field(name="New Balance",
+                    value=f"{new_balance} coins",
+                    inline=False)
+    embed.add_field(name="Next Claim", value="Tomorrow!", inline=True)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Admin add gacha role command
+@bot.tree.command(name="addrole",
+                  description="[Admin Only] Add a role to gacha system")
+async def add_gacha_role(interaction: discord.Interaction,
+                         role: discord.Role,
+                         probability: float,
+                         description: str = ""):
+    # Check admin permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "This command is for administrators only.", ephemeral=True)
+        return
+
+    if probability < 0.1 or probability > 100:
+        await interaction.response.send_message(
+            "Probability must be between 0.1 and 100.0", ephemeral=True)
+        return
+
+    async with aiosqlite.connect('bot_database.db') as db:
+        # Check if role already exists
+        cursor = await db.execute(
+            'SELECT id FROM gacha_roles WHERE role_id = ?', (role.id, ))
+        existing = await cursor.fetchone()
+
+        if existing:
+            await interaction.response.send_message(
+                f"Role {role.mention} is already in gacha system!",
+                ephemeral=True)
+            return
+
+        # Add role to gacha
+        await db.execute(
+            'INSERT INTO gacha_roles (role_id, role_name, probability, description) VALUES (?, ?, ?, ?)',
+            (role.id, role.name, probability, description))
+        await db.commit()
+
+    embed = discord.Embed(title="🎲 Gacha Role Added", color=0x00ff00)
+    embed.add_field(name="Role", value=role.mention, inline=True)
+    embed.add_field(name="Probability", value=f"{probability}%", inline=True)
+    embed.add_field(name="Description",
+                    value=description or "No description",
+                    inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Admin remove gacha role command
+@bot.tree.command(name="removerole",
+                  description="[Admin Only] Remove a role from gacha system")
+async def remove_gacha_role(interaction: discord.Interaction,
+                            role: discord.Role):
+    # Check admin permissions
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "This command is for administrators only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect('bot_database.db') as db:
+        cursor = await db.execute(
+            'SELECT role_name FROM gacha_roles WHERE role_id = ?', (role.id, ))
+        existing = await cursor.fetchone()
+
+        if not existing:
+            await interaction.response.send_message(
+                f"Role {role.mention} is not in gacha system!", ephemeral=True)
+            return
+
+        await db.execute('DELETE FROM gacha_roles WHERE role_id = ?',
+                         (role.id, ))
+        await db.commit()
+
+    embed = discord.Embed(title="🗑️ Gacha Role Removed", color=0xff0000)
+    embed.add_field(name="Removed Role", value=role.mention, inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Gacha list command
+@bot.tree.command(name="gachalist",
+                  description="View all available gacha roles")
+async def gacha_list(interaction: discord.Interaction):
+    async with aiosqlite.connect('bot_database.db') as db:
+        cursor = await db.execute(
+            'SELECT role_id, role_name, probability, description FROM gacha_roles ORDER BY probability DESC'
+        )
+        roles = await cursor.fetchall()
+
     if not roles:
-        embed.description = "現在、登録されているガチャロールはありません。"
-    else:
-        embed.description = f"登録されているガチャロール数: {len(roles)}"
-        for role in roles:
-            rarity_emoji = get_rarity_emoji(role["rarity"])
-            embed.add_field(
-                name=f"ID: {role['id']} | {rarity_emoji} {role['name']}",
-                value=f"レアリティ: {role['rarity']}\n価格: {role['price']:,}円\n{role['description']}",
-                inline=False
-            )
-    
-    embed.set_footer(text="/add_role で追加、/remove_role <ID> で削除")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# 従来のコマンド（管理用）
-def is_admin(ctx):
-    """管理者権限をチェックする関数"""
-    return ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner
-
-@bot.command(name='restart')
-async def restart_bot(ctx):
-    """ボットを再起動するコマンド（管理者専用）"""
-    if not is_admin(ctx):
-        await ctx.send('⚠️ このコマンドは管理者のみ使用できます。')
+        await interaction.response.send_message("No gacha roles available.",
+                                                ephemeral=True)
         return
-    
-    embed = discord.Embed(
-        title='🔄 ボット再起動',
-        description='ボットを再起動しています...\n数秒後に再接続されます。',
-        color=discord.Color.orange()
-    )
-    embed.set_footer(text=f'実行者: {ctx.author}')
-    await ctx.send(embed=embed)
-    
-    print(f'[{datetime.now()}] {ctx.author}によりボットが再起動されました')
-    
-    # プロセス全体を終了（Replitワークフローが自動的に再起動）
-    await asyncio.sleep(1)  # メッセージ送信を待つ
-    sys.exit(0)
 
-@bot.command(name='status')
-async def bot_status(ctx):
-    """ボットの状態を表示するコマンド"""
-    embed = discord.Embed(
-        title='🤖 ボットステータス',
-        color=discord.Color.green()
-    )
-    
-    # 稼働時間の計算
-    if bot_start_time:
-        uptime = datetime.now() - bot_start_time
-        uptime_str = f'{uptime.days}日 {uptime.seconds//3600}時間 {(uptime.seconds//60)%60}分'
-    else:
-        uptime_str = '不明'
-    
-    embed.add_field(name='レイテンシ', value=f'{round(bot.latency * 1000)}ms', inline=True)
-    embed.add_field(name='接続サーバー数', value=f'{len(bot.guilds)}', inline=True)
-    embed.add_field(name='稼働時間', value=uptime_str, inline=True)
-    embed.add_field(name='ユーザー数', value=f'{len(bot.users)}', inline=True)
-    embed.add_field(name='Pythonバージョン', value=f'{sys.version[:5]}', inline=True)
-    embed.add_field(name='discord.pyバージョン', value=discord.__version__, inline=True)
-    
-    await ctx.send(embed=embed)
+    embed = discord.Embed(title="🎲 Role Gacha List", color=0x9932cc)
 
-@bot.command(name='sync')
-async def sync_commands(ctx):
-    """スラッシュコマンドを強制同期するコマンド（管理者専用）"""
-    if not is_admin(ctx):
-        await ctx.send('⚠️ このコマンドは管理者のみ使用できます。')
-        return
-    
-    embed = discord.Embed(
-        title='🔄 コマンド同期中',
-        description='スラッシュコマンドを同期しています...',
-        color=discord.Color.blue()
-    )
-    message = await ctx.send(embed=embed)
-    
-    try:
-        # グローバル同期
-        synced_global = await bot.tree.sync()
-        
-        # 現在のギルドで同期
-        synced_guild = await bot.tree.sync(guild=ctx.guild)
-        
-        embed = discord.Embed(
-            title='✅ コマンド同期完了',
-            color=discord.Color.green()
-        )
-        embed.add_field(name='グローバル同期', value=f'{len(synced_global)}個のコマンド', inline=True)
-        embed.add_field(name='ギルド同期', value=f'{len(synced_guild)}個のコマンド', inline=True)
-        embed.add_field(name='注意', value='コマンドが反映されるまで最大1時間かかる場合があります', inline=False)
-        
-        await message.edit(embed=embed)
-        print(f'[{datetime.now()}] {ctx.author}がコマンド同期を実行')
-        
-    except Exception as e:
-        embed = discord.Embed(
-            title='❌ 同期エラー',
-            description=f'エラー: {e}',
-            color=discord.Color.red()
-        )
-        await message.edit(embed=embed)
-
-async def start_bot():
-    """ボットを開始する関数（自動再接続機能付き）"""
-    token = os.getenv('DISCORD_BOT_TOKEN')
-    
-    if not token:
-        print('エラー: DISCORD_BOT_TOKENが設定されていません。')
-        exit(1)
-    
-    while True:
+    for role_id, role_name, probability, description in roles:
         try:
-            print(f'[{datetime.now()}] Discordボットを開始しています...')
-            await bot.start(token)
-        except discord.LoginFailure:
-            print('エラー: 無効なボットトークンです。')
-            break
-        except discord.ConnectionClosed:
-            print(f'[{datetime.now()}] 接続が閉じられました。5秒後に再接続します...')
-            await asyncio.sleep(5)
-        except Exception as e:
-            print(f'[{datetime.now()}] エラーが発生しました: {e}')
-            print('10秒後に再接続を試行します...')
-            await asyncio.sleep(10)
-            if not bot.is_closed():
-                await bot.close()
-        finally:
-            # tryブロックの後に必ず実行される部分。
-            # 今回は特に処理がないためpassを記述。
-            pass
+            role = interaction.guild.get_role(role_id)
+            role_display = role.mention if role else f"@{role_name} (Deleted)"
+        except:
+            role_display = f"@{role_name}"
 
-if __name__ == '__main__':
+        embed.add_field(
+            name=f"{role_display}",
+            value=
+            f"**Probability:** {probability}%\n**Description:** {description or 'No description'}",
+            inline=False)
+
+    embed.add_field(
+        name="How to play",
+        value="Use /gacha to try your luck! Cost: 100 coins per roll",
+        inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# Role gacha command
+@bot.tree.command(name="gacha", description="Try your luck at role gacha!")
+async def role_gacha(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    gacha_cost = 100  # Fixed cost per gacha roll
+
+    async with aiosqlite.connect('bot_database.db') as db:
+        # Get all gacha roles
+        cursor = await db.execute(
+            'SELECT role_id, role_name, probability, description FROM gacha_roles'
+        )
+        roles = await cursor.fetchall()
+
+    if not roles:
+        await interaction.response.send_message(
+            "No gacha roles are currently available.", ephemeral=True)
+        return
+
+    # Check user balance
+    balance = await get_user_balance(user_id)
+
+    if balance < gacha_cost:
+        await interaction.response.send_message(
+            f"Insufficient balance! You need {gacha_cost} coins to play gacha.",
+            ephemeral=True)
+        return
+
+    # Pay the gacha cost first
+    new_balance = balance - gacha_cost
+    await update_user_balance(user_id, new_balance)
+
+    # Weighted random selection based on probability
+    import random
+
+    # Calculate total probability weight
+    total_weight = sum(role[2] for role in roles)
+
+    # Add "miss" chance if total probability < 100
+    miss_chance = max(0, 100 - total_weight)
+
+    # Generate random number
+    rand = random.uniform(0, 100)
+    current = 0
+
+    selected_role = None
+    for role_id, role_name, probability, description in roles:
+        current += probability
+        if rand <= current:
+            selected_role = (role_id, role_name, probability, description)
+            break
+
+    # Check if it's a miss
+    if selected_role is None or rand > (100 - miss_chance):
+        embed = discord.Embed(title="💸 Gacha Result", color=0xff0000)
+        embed.add_field(name="Result",
+                        value="**MISS!** Better luck next time!",
+                        inline=False)
+        embed.add_field(name="Cost", value=f"{gacha_cost} coins", inline=True)
+        embed.add_field(name="New Balance",
+                        value=f"{new_balance} coins",
+                        inline=True)
+
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # Success - give role (no additional cost)
+    role_id, role_name, probability, description = selected_role
+
     try:
-        asyncio.run(start_bot())
-    except KeyboardInterrupt:
-        print('ボットを停止しています...')
+        role = interaction.guild.get_role(role_id)
+        if role is None:
+            await interaction.response.send_message(
+                "Error: Role no longer exists on this server.", ephemeral=True)
+            return
+
+        # Check if user already has the role
+        if role in interaction.user.roles:
+            embed = discord.Embed(title="🔄 Duplicate Role", color=0xff9900)
+            embed.add_field(name="Result",
+                            value=f"You already have {role.mention}!",
+                            inline=False)
+            embed.add_field(name="Cost",
+                            value=f"{gacha_cost} coins",
+                            inline=True)
+            embed.add_field(name="New Balance",
+                            value=f"{new_balance} coins",
+                            inline=True)
+
+            await interaction.response.send_message(embed=embed)
+            return
+
+        # Give role to user
+        await interaction.user.add_roles(role)
+
+        embed = discord.Embed(title="🎉 Gacha Success!", color=0x00ff00)
+        embed.add_field(name="Congratulations!",
+                        value=f"You won {role.mention}!",
+                        inline=False)
+        embed.add_field(name="Probability",
+                        value=f"{probability}%",
+                        inline=True)
+        embed.add_field(name="Cost", value=f"{gacha_cost} coins", inline=True)
+        embed.add_field(name="New Balance",
+                        value=f"{new_balance} coins",
+                        inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Error: Bot doesn't have permission to assign roles.",
+            ephemeral=True)
     except Exception as e:
-        print(f'予期しないエラー: {e}')
+        await interaction.response.send_message(f"Error occurred: {str(e)}",
+                                                ephemeral=True)
+
+
+# Leaderboard command
+@bot.tree.command(name="leaderboard",
+                  description="View the top 10 richest users")
+async def leaderboard(interaction: discord.Interaction):
+    async with aiosqlite.connect('bot_database.db') as db:
+        # Get top 10 users by balance
+        cursor = await db.execute('''
+            SELECT user_id, balance 
+            FROM users 
+            WHERE balance > 0 
+            ORDER BY balance DESC 
+            LIMIT 10
+        ''')
+        top_users = await cursor.fetchall()
+
+    if not top_users:
+        await interaction.response.send_message(
+            "No users with positive balance found.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="💰 Wealth Leaderboard", color=0xffd700)
+    embed.set_footer(text="Top 10 Richest Users")
+
+    for i, (user_id, balance) in enumerate(top_users, 1):
+        try:
+            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            username = user.display_name if user else f"Unknown User ({user_id})"
+        except:
+            username = f"Unknown User ({user_id})"
+
+        # Medal emojis for top 3
+        if i == 1:
+            rank_emoji = "🥇"
+        elif i == 2:
+            rank_emoji = "🥈"
+        elif i == 3:
+            rank_emoji = "🥉"
+        else:
+            rank_emoji = f"{i}."
+
+        embed.add_field(name=f"{rank_emoji} {username}",
+                        value=f"{balance:,} coins",
+                        inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+# ボット起動
+if __name__ == "__main__":
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("DISCORD_TOKEN が設定されていません。.env ファイルまたは環境変数を確認してください。")
+    else:
+        asyncio.run(init_db())
+        bot.run(token)
